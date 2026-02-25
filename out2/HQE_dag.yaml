@@ -1,0 +1,35 @@
+dag:
+  dag_id: HQE_dag
+  schedule: '@daily'
+  default_args:
+    owner: ca7_migration
+    retries: 1
+    retry_delay_minutes: 5
+  tasks:
+  - task_id: wait_for_XTRNAL
+    operator: ExternalTaskSensor
+    external_dag_id: XTR_dag
+    external_task_id: XTRNAL
+    depends_on: []
+  - task_id: HQEABC
+    operator: BashOperator
+    bash_command: '{{ params.jcl }}'
+    params:
+      jcl: /scripts/run_b.sh
+    depends_on: []
+  - task_id: HQEXYZ
+    operator: BashOperator
+    bash_command: '{{ params.jcl }}'
+    params:
+      jcl: /scripts/run_c.sh
+    depends_on: []
+    mutually_exclusive_with:
+    - HQEABC
+  - task_id: HQEAED
+    operator: BashOperator
+    bash_command: '{{ params.jcl }}'
+    params:
+      jcl: /scripts/run_a.sh
+    depends_on:
+    - HQEABC
+    - wait_for_XTRNAL

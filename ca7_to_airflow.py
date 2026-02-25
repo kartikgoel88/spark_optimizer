@@ -6,6 +6,12 @@ Reads an Excel file with job_name, dependencies, and jcl_name columns,
 normalizes CA7 naming (strip last 2 chars), merges by logical job and module,
 validates the dependency graph, and writes one YAML file per module.
 
+- Missing upstream jobs are emitted as ExternalTaskSensor tasks.
+- Dependencies that start with "/" are treated as mutually exclusive (stored
+  in mutually_exclusive_with in the task YAML).
+- Dependencies that start with "J" are time dependencies; the last 4 characters
+  denote the time (HHMM). Emitted as TimeSensor tasks.
+
 Dependencies: pip install pandas openpyxl pyyaml
 """
 
@@ -64,12 +70,18 @@ def load_excel(path: str) -> pd.DataFrame:
 def build_logical_jobs_and_deps(df: pd.DataFrame):
     """
     Normalize all job names and dependencies, merge duplicates.
+    Dependency conventions:
+      - "/" prefix => mutually exclusive
+      - "J" prefix => time dependency; last 4 chars = time (HHMM)
+      - else => normal upstream job dependency
     Returns:
-        logical_jobs: dict[normalized_name] -> { "jcl_name": str, "module": str }
-        deps: dict[normalized_name] -> set of normalized upstream task_ids
+        logical_jobs, deps, mutually_exclusive_deps, time_deps
+        time_deps: dict[normalized_name] -> set of "HHMM" strings
     """
     logical_jobs = {}  # normalized_name -> { jcl_name, module }
     deps = defaultdict(set)  # normalized_name -> set of upstream normalized names
+    mutually_exclusive_deps = defaultdict(set)  # "/" prefix = mutually exclusive
+    time_deps = defaultdict(set)  # "J" prefix => last 4 chars = time (HHMM)
 
     for _, row in df.iterrows():
         raw_name = row["job_name"]
@@ -83,24 +95,32 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
         if not norm:
             continue
 
-        # Merge: keep one jcl_name per logical job (last seen wins; can be changed to first)
+        # Merge: keep one jcl_name per logical job (last seen wins)
         if pd.notna(jcl_name) and str(jcl_name).strip():
             logical_jobs[norm] = {
                 "jcl_name": str(jcl_name).strip(),
                 "module": get_module(norm),
             }
 
-        # Normalize and merge dependencies
+        # Parse dependencies: "/" => mutually exclusive, "J" => time (last 4 chars), else normal
         if pd.notna(raw_deps) and str(raw_deps).strip():
             for d in str(raw_deps).split(","):
                 d = d.strip()
                 if not d:
                     continue
-                dep_norm = normalize_job_name(d)
-                if dep_norm:
-                    deps[norm].add(dep_norm)
+                if d.startswith("/"):
+                    dep_norm = normalize_job_name(d[1:].strip())
+                    if dep_norm:
+                        mutually_exclusive_deps[norm].add(dep_norm)
+                elif d.startswith("J") and len(d) >= 5:
+                    # Time dependency: last 4 characters denote time (HHMM)
+                    time_deps[norm].add(d[-4:])
+                else:
+                    dep_norm = normalize_job_name(d)
+                    if dep_norm:
+                        deps[norm].add(dep_norm)
 
-    return dict(logical_jobs), dict(deps)
+    return dict(logical_jobs), dict(deps), dict(mutually_exclusive_deps), dict(time_deps)
 
 
 # ---------------------------------------------------------------------------
@@ -147,42 +167,108 @@ def topological_sort(nodes: list[str], deps: dict[str, set]) -> list[str]:
     return result
 
 
-def validate_dependencies(
+def validate_and_order(
     logical_jobs: dict, deps: dict, module: str, module_jobs: list[str]
-) -> None:
-    """Ensure no missing upstream and no circular deps. Raises on error."""
-    for task_id in module_jobs:
-        for up in deps.get(task_id, set()):
-            if up not in logical_jobs:
-                raise Exception(f"Missing upstream job: {up} (referenced by {task_id})")
-    # Topological sort raises if circular dependency
-    topological_sort(module_jobs, deps)
+) -> list[str]:
+    """
+    Validate only in-module deps for circular; missing upstreams are allowed
+    (emitted as external sensors). Returns topologically ordered task list.
+    """
+    return topological_sort(module_jobs, deps)
 
 
 # ---------------------------------------------------------------------------
 # Build and write YAML per module
 # ---------------------------------------------------------------------------
+def _sensor_task_id(external_task_id: str) -> str:
+    """Task id for the ExternalTaskSensor that waits for an external job."""
+    return f"wait_for_{external_task_id}"
+
+
+def _time_sensor_task_id(hhmm: str) -> str:
+    """Task id for the TimeSensor that waits until a time of day (HHMM)."""
+    return f"time_{hhmm}"
+
+
+def _hhmm_to_target_time(hhmm: str) -> str:
+    """Convert 4-char HHMM to Airflow target_time string 'HH:MM:00'."""
+    if len(hhmm) != 4 or not hhmm.isdigit():
+        return "00:00:00"
+    return f"{hhmm[:2]}:{hhmm[2:]}:00"
+
+
 def build_dag_yaml(
     module: str,
     ordered_tasks: list[str],
     logical_jobs: dict,
     deps: dict,
+    mutually_exclusive_deps: dict,
+    time_deps: dict,
 ) -> dict:
-    """Build the DAG structure for one module."""
+    """
+    Build the DAG structure for one module.
+    Missing upstreams -> ExternalTaskSensor; "/" deps -> mutually_exclusive_with;
+    "J" deps (last 4 = time) -> TimeSensor tasks.
+    """
     task_list = []
+    ordered_set = set(ordered_tasks)
+    # Collect external (missing) upstreams referenced by tasks in this module
+    external_upstreams = set()
+    for task_id in ordered_tasks:
+        for u in deps.get(task_id, set()):
+            if u not in logical_jobs:
+                external_upstreams.add(u)
+
+    # Sensor tasks for missing upstream jobs (external dependencies)
+    for ext_id in sorted(external_upstreams):
+        ext_module = get_module(ext_id)
+        sensor_id = _sensor_task_id(ext_id)
+        task_list.append({
+            "task_id": sensor_id,
+            "operator": "ExternalTaskSensor",
+            "external_dag_id": f"{ext_module}_dag",
+            "external_task_id": ext_id,
+            "depends_on": [],
+        })
+
+    # TimeSensor tasks for time dependencies (J...HHMM)
+    time_upstreams = set()
+    for task_id in ordered_tasks:
+        time_upstreams |= time_deps.get(task_id, set())
+    for hhmm in sorted(time_upstreams):
+        task_list.append({
+            "task_id": _time_sensor_task_id(hhmm),
+            "operator": "TimeSensor",
+            "target_time": _hhmm_to_target_time(hhmm),
+            "depends_on": [],
+        })
+
+    # Regular tasks (BashOperator)
     for task_id in ordered_tasks:
         info = logical_jobs.get(task_id, {})
         jcl = info.get("jcl_name", "")
-        upstream = [u for u in deps.get(task_id, set()) if u in set(ordered_tasks)]
-        # Secondary: sort upstream list for stable YAML
+        # In-module upstreams
+        upstream = [u for u in deps.get(task_id, set()) if u in ordered_set]
+        # External upstreams: depend on the sensor task
+        for u in deps.get(task_id, set()):
+            if u not in logical_jobs:
+                upstream.append(_sensor_task_id(u))
+        # Time dependencies: depend on the TimeSensor task
+        for hhmm in time_deps.get(task_id, set()):
+            upstream.append(_time_sensor_task_id(hhmm))
         upstream = sorted(upstream)
-        task_list.append({
+        # Mutually exclusive: only include those that are in this DAG
+        mut_ex = sorted(mutually_exclusive_deps.get(task_id, set()) & ordered_set)
+        task_def = {
             "task_id": task_id,
             "operator": "BashOperator",
             "bash_command": "{{ params.jcl }}",
             "params": {"jcl": jcl},
             "depends_on": upstream,
-        })
+        }
+        if mut_ex:
+            task_def["mutually_exclusive_with"] = mut_ex
+        task_list.append(task_def)
 
     return {
         "dag": {
@@ -210,9 +296,9 @@ def write_yaml(path: Path, data: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def run(input_xlsx: str, output_dir: str) -> None:
-    """Load Excel, normalize, group by module, validate, and write YAMLs."""
+    """Load Excel, normalize, group by module, validate (circular only), and write YAMLs."""
     df = load_excel(input_xlsx)
-    logical_jobs, deps = build_logical_jobs_and_deps(df)
+    logical_jobs, deps, mutually_exclusive_deps, time_deps = build_logical_jobs_and_deps(df)
 
     # Group by module
     by_module = defaultdict(list)
@@ -227,10 +313,10 @@ def run(input_xlsx: str, output_dir: str) -> None:
     for module, job_list in by_module.items():
         if not module:
             continue
-        # Validate: missing upstream and circular
-        validate_dependencies(logical_jobs, deps, module, job_list)
-        ordered = topological_sort(job_list, deps)
-        dag_data = build_dag_yaml(module, ordered, logical_jobs, deps)
+        ordered = validate_and_order(logical_jobs, deps, module, job_list)
+        dag_data = build_dag_yaml(
+            module, ordered, logical_jobs, deps, mutually_exclusive_deps, time_deps
+        )
         write_yaml(out_path / f"{module}_dag.yaml", dag_data)
 
     logger.info("Done. Wrote %d module DAG(s) to %s", len(by_module), output_dir)
