@@ -1,0 +1,21 @@
+dag:
+  dag_id: HQE_dag
+  schedule: '@daily'
+  default_args:
+    owner: ca7_migration
+    retries: 1
+    retry_delay_minutes: 5
+  tasks:
+  - task_id: HQEABC
+    operator: BashOperator
+    bash_command: '{{ params.jcl }}'
+    params:
+      jcl: /scripts/run_hqe_b.sh
+    depends_on: []
+  - task_id: HQEAED
+    operator: BashOperator
+    bash_command: '{{ params.jcl }}'
+    params:
+      jcl: /scripts/run_hqe_a.sh
+    depends_on:
+    - HQEABC
