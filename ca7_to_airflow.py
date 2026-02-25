@@ -9,8 +9,8 @@ validates the dependency graph, and writes one YAML file per module.
 - Missing upstream jobs are emitted as ExternalTaskSensor tasks.
 - Dependencies that start with "/" are treated as mutually exclusive (stored
   in mutually_exclusive_with in the task YAML).
-- Dependencies that start with "J" are time dependencies; the last 4 characters
-  denote the time (HHMM). Emitted as TimeSensor tasks.
+- Dependencies that start with "J" are time dependencies (e.g. JS1T1945); the
+  last 4 characters denote the time (HHMM). Emitted as TimeSensor tasks.
 
 Dependencies: pip install pandas openpyxl pyyaml
 """
@@ -72,7 +72,7 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
     Normalize all job names and dependencies, merge duplicates.
     Dependency conventions:
       - "/" prefix => mutually exclusive
-      - "J" prefix => time dependency; last 4 chars = time (HHMM)
+      - "J" prefix => time dependency (e.g. JS1T1945); last 4 chars = HHMM
       - else => normal upstream job dependency
     Returns:
         logical_jobs, deps, mutually_exclusive_deps, time_deps
@@ -112,9 +112,11 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
                     dep_norm = normalize_job_name(d[1:].strip())
                     if dep_norm:
                         mutually_exclusive_deps[norm].add(dep_norm)
-                elif d.startswith("J") and len(d) >= 5:
-                    # Time dependency: last 4 characters denote time (HHMM)
-                    time_deps[norm].add(d[-4:])
+                elif d.startswith("J") and len(d) >= 4:
+                    # Time dependency: format like JS1T1945; last 4 chars = HHMM
+                    hhmm = d[-4:]
+                    if hhmm.isdigit():
+                        time_deps[norm].add(hhmm)
                 else:
                     dep_norm = normalize_job_name(d)
                     if dep_norm:
