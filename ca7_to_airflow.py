@@ -6,9 +6,10 @@ Reads an Excel file with job_name, dependencies, and jcl_name columns,
 normalizes CA7 naming (strip last 2 chars), merges by logical job and module,
 validates the dependency graph, and writes one YAML file per module.
 
-- Missing upstream jobs are emitted as ExternalTaskSensor tasks.
-- Dependencies that start with "/" are treated as mutually exclusive (stored
-  in mutually_exclusive_with in the task YAML).
+- Missing upstream jobs are emitted as ExternalTaskSensor tasks. Task IDs use
+  normalized names (no leading "/"; day+run already removed when parsing).
+- Dependencies that start with "/" are mutually exclusive only (mutually_exclusive_with);
+  they do not create external sensors.
 - Dependencies that start with "J" are time dependencies (e.g. JS1T1945); the
   last 4 characters denote the time (HHMM). Emitted as TimeSensor tasks.
 
@@ -214,22 +215,29 @@ def build_dag_yaml(
     """
     task_list = []
     ordered_set = set(ordered_tasks)
-    # Collect external (missing) upstreams referenced by tasks in this module
+    # External (missing) upstreams: only normal deps create sensors.
+    # Deps starting with "/" are mutually exclusive only and are not in deps.
     external_upstreams = set()
     for task_id in ordered_tasks:
         for u in deps.get(task_id, set()):
             if u not in logical_jobs:
                 external_upstreams.add(u)
 
-    # Sensor tasks for missing upstream jobs (external dependencies)
+    # Sensor tasks for missing upstream jobs. Ids are already normalized when parsed
+    # (no day+run). Strip any leading "/" defensively so we never emit wait_for_/HQERUD1.
+    seen = set()
     for ext_id in sorted(external_upstreams):
-        ext_module = get_module(ext_id)
-        sensor_id = _sensor_task_id(ext_id)
+        ext_norm = ext_id.lstrip("/").strip() or ext_id
+        if ext_norm in seen:
+            continue
+        seen.add(ext_norm)
+        ext_module = get_module(ext_norm)
+        sensor_id = _sensor_task_id(ext_norm)
         task_list.append({
             "task_id": sensor_id,
             "operator": "ExternalTaskSensor",
             "external_dag_id": f"{ext_module}_dag",
-            "external_task_id": ext_id,
+            "external_task_id": ext_norm,
             "depends_on": [],
         })
 
@@ -251,10 +259,11 @@ def build_dag_yaml(
         jcl = info.get("jcl_name", "")
         # In-module upstreams
         upstream = [u for u in deps.get(task_id, set()) if u in ordered_set]
-        # External upstreams: depend on the sensor task
+        # External upstreams: depend on the sensor task (same id as sensor, no leading "/")
         for u in deps.get(task_id, set()):
             if u not in logical_jobs:
-                upstream.append(_sensor_task_id(u))
+                u_norm = u.lstrip("/").strip() or u
+                upstream.append(_sensor_task_id(u_norm))
         # Time dependencies: depend on the TimeSensor task
         for hhmm in time_deps.get(task_id, set()):
             upstream.append(_time_sensor_task_id(hhmm))
