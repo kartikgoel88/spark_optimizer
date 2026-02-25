@@ -12,6 +12,9 @@ validates the dependency graph, and writes one YAML file per module.
   they do not create external sensors.
 - Dependencies that start with "J" are time dependencies (e.g. JS1T1945); the
   last 4 characters denote the time (HHMM). Emitted as TimeSensor tasks.
+- Optional column "runs" (e.g. "3", "3,4"): when set, that row's dependencies
+  apply only for those run numbers (run = last digit of job name, e.g. 23->3).
+  Output as depends_on_by_run in task YAML.
 
 Dependencies: pip install pandas openpyxl pyyaml
 """
@@ -58,7 +61,7 @@ def get_module(normalized_name: str) -> str:
 # Load and normalize data
 # ---------------------------------------------------------------------------
 def load_excel(path: str) -> pd.DataFrame:
-    """Load Excel file; expect columns: job_name, dependencies, jcl_name."""
+    """Load Excel file; required: job_name, dependencies, jcl_name. Optional: runs."""
     logger.info("Loading Excel: %s", path)
     df = pd.read_excel(path)
     required = {"job_name", "dependencies", "jcl_name"}
@@ -68,6 +71,26 @@ def load_excel(path: str) -> pd.DataFrame:
     return df
 
 
+def _parse_runs(value) -> set[str]:
+    """Parse optional 'runs' column: '3', '3,4', '[3,4]' -> set of run digits as strings (e.g. '3', '4')."""
+    if pd.isna(value) or not str(value).strip():
+        return set()
+    raw = str(value).strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1].strip()
+    result = set()
+    for r in raw.split(","):
+        r = r.strip()
+        if not r:
+            continue
+        # Excel may read numbers as 3.0; normalize to 3
+        try:
+            result.add(str(int(float(r))))
+        except (ValueError, TypeError):
+            result.add(r)
+    return result
+
+
 def build_logical_jobs_and_deps(df: pd.DataFrame):
     """
     Normalize all job names and dependencies, merge duplicates.
@@ -75,19 +98,26 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
       - "/" prefix => mutually exclusive
       - "J" prefix => time dependency (e.g. JS1T1945); last 4 chars = HHMM
       - else => normal upstream job dependency
+    Optional column "runs": if set (e.g. "3", "3,4"), this row's normal deps
+    apply only for those run numbers (run = last digit of job name, e.g. 21->1, 23->3).
     Returns:
-        logical_jobs, deps, mutually_exclusive_deps, time_deps
-        time_deps: dict[normalized_name] -> set of "HHMM" strings
+        logical_jobs, deps, mutually_exclusive_deps, time_deps, deps_by_run
+        deps_by_run: dict[normalized_name] -> dict[run_str] -> set of upstream normalized names
     """
     logical_jobs = {}  # normalized_name -> { jcl_name, module }
-    deps = defaultdict(set)  # normalized_name -> set of upstream normalized names
-    mutually_exclusive_deps = defaultdict(set)  # "/" prefix = mutually exclusive
-    time_deps = defaultdict(set)  # "J" prefix => last 4 chars = time (HHMM)
+    deps = defaultdict(set)  # base deps
+    mutually_exclusive_deps = defaultdict(set)
+    time_deps = defaultdict(set)
+    # Conditional deps by run: deps_by_run[norm][run] = set of additional upstreams
+    deps_by_run = defaultdict(lambda: defaultdict(set))
+
+    has_runs_col = "runs" in df.columns
 
     for _, row in df.iterrows():
         raw_name = row["job_name"]
         raw_deps = row["dependencies"]
         jcl_name = row["jcl_name"]
+        runs = _parse_runs(row["runs"]) if has_runs_col else set()
 
         if pd.isna(raw_name):
             continue
@@ -117,16 +147,25 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
                     if dep_norm:
                         mutually_exclusive_deps[norm].add(dep_norm)
                 elif d.startswith("J") and len(d) >= 4:
-                    # Time dependency: format like JS1T1945; last 4 chars = HHMM
                     hhmm = d[-4:]
                     if hhmm.isdigit():
                         time_deps[norm].add(hhmm)
                 else:
                     dep_norm = normalize_job_name(d)
                     if dep_norm:
-                        deps[norm].add(dep_norm)
+                        if runs:
+                            for r in runs:
+                                deps_by_run[norm][r].add(dep_norm)
+                        else:
+                            deps[norm].add(dep_norm)
 
-    return dict(logical_jobs), dict(deps), dict(mutually_exclusive_deps), dict(time_deps)
+    return (
+        dict(logical_jobs),
+        dict(deps),
+        dict(mutually_exclusive_deps),
+        dict(time_deps),
+        dict(deps_by_run),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +259,7 @@ def build_dag_yaml(
     deps: dict,
     mutually_exclusive_deps: dict,
     time_deps: dict,
+    deps_by_run: dict,
     runner_script: str = "",
     first_arg: str = "",
 ) -> dict:
@@ -227,6 +267,7 @@ def build_dag_yaml(
     Build the DAG structure for one module.
     Missing upstreams -> ExternalTaskSensor; "/" deps -> mutually_exclusive_with;
     "J" deps (last 4 = time) -> TimeSensor tasks.
+    deps_by_run: optional run-conditional deps -> depends_on_by_run in YAML.
     Bash: same runner_script and first_arg for all tasks (in default_args);
     only params.jcl (per-task) differs.
     """
@@ -282,7 +323,8 @@ def build_dag_yaml(
         # Time dependencies: depend on the TimeSensor task
         for hhmm in time_deps.get(task_id, set()):
             upstream.append(_time_sensor_task_id(hhmm))
-        upstream = sorted(upstream)
+        # Unique, stable order
+        upstream = sorted(set(upstream))
         # Mutually exclusive: only include those that are in this DAG
         mut_ex = sorted(mutually_exclusive_deps.get(task_id, set()) & ordered_set)
         # Same script + same first arg (from default_args) + per-task jcl
@@ -295,6 +337,22 @@ def build_dag_yaml(
         }
         if mut_ex:
             task_def["mutually_exclusive_with"] = mut_ex
+        # Run-conditional additional dependencies (e.g. run 3 and 4)
+        run_deps = deps_by_run.get(task_id, {})
+        if run_deps:
+            depends_on_by_run = {}
+            for run_str, run_upstreams in sorted(run_deps.items()):
+                run_list = []
+                for u in run_upstreams:
+                    if u in ordered_set:
+                        run_list.append(u)
+                    elif u not in logical_jobs:
+                        run_list.append(_sensor_task_id(_normalize_external_id(u)))
+                run_list = sorted(set(run_list))
+                if run_list:
+                    depends_on_by_run[run_str] = run_list
+            if depends_on_by_run:
+                task_def["depends_on_by_run"] = depends_on_by_run
         task_list.append(task_def)
 
     default_args = {
@@ -333,7 +391,7 @@ def run(
 ) -> None:
     """Load Excel, normalize, group by module, validate (circular only), and write YAMLs."""
     df = load_excel(input_xlsx)
-    logical_jobs, deps, mutually_exclusive_deps, time_deps = build_logical_jobs_and_deps(df)
+    logical_jobs, deps, mutually_exclusive_deps, time_deps, deps_by_run = build_logical_jobs_and_deps(df)
 
     # Group by module
     by_module = defaultdict(list)
@@ -356,6 +414,7 @@ def run(
             deps,
             mutually_exclusive_deps,
             time_deps,
+            deps_by_run,
             runner_script=runner_script,
             first_arg=first_arg,
         )

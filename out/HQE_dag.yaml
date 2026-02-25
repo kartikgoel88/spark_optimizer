@@ -5,21 +5,33 @@ dag:
     owner: ca7_migration
     retries: 1
     retry_delay_minutes: 5
-    runner_script: /opt/ca7/run.sh
-    first_arg: execute
+    runner_script: /opt/scripts/ca7_runner.sh
+    first_arg: run
   tasks:
   - task_id: HQEABC
     operator: BashOperator
     bash_command: '{{ dag.default_args.runner_script }} {{ dag.default_args.first_arg
       }} {{ params.jcl }}'
     params:
-      jcl: /scripts/run_hqe_b.sh
+      jcl: /scripts/run_b.sh
+    depends_on: []
+  - task_id: HQEXYZ
+    operator: BashOperator
+    bash_command: '{{ dag.default_args.runner_script }} {{ dag.default_args.first_arg
+      }} {{ params.jcl }}'
+    params:
+      jcl: /scripts/run_c.sh
     depends_on: []
   - task_id: HQEAED
     operator: BashOperator
     bash_command: '{{ dag.default_args.runner_script }} {{ dag.default_args.first_arg
       }} {{ params.jcl }}'
     params:
-      jcl: /scripts/run_hqe_a.sh
+      jcl: /scripts/run_a.sh
     depends_on:
     - HQEABC
+    depends_on_by_run:
+      '3':
+      - HQEXYZ
+      '4':
+      - HQEXYZ
