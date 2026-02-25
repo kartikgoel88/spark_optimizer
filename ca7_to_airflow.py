@@ -103,9 +103,12 @@ def build_logical_jobs_and_deps(df: pd.DataFrame):
                 "module": get_module(norm),
             }
 
-        # Parse dependencies: "/" => mutually exclusive, "J" => time (last 4 chars), else normal
+        # Parse dependencies: column may be "[dep1, dep2, ...]" (brackets, comma-separated)
         if pd.notna(raw_deps) and str(raw_deps).strip():
-            for d in str(raw_deps).split(","):
+            raw = str(raw_deps).strip()
+            if raw.startswith("[") and raw.endswith("]"):
+                raw = raw[1:-1].strip()
+            for d in raw.split(","):
                 d = d.strip()
                 if not d:
                     continue
@@ -188,6 +191,16 @@ def _sensor_task_id(external_task_id: str) -> str:
     return f"wait_for_{external_task_id}"
 
 
+def _normalize_external_id(ext_id: str) -> str:
+    """Normalize external/missing upstream id for sensor: strip leading '/', strip trailing day+run (1 or 2 digits)."""
+    s = (ext_id or "").lstrip("/").strip()
+    if len(s) >= 2 and s[-2:].isdigit():
+        return s[:-2]
+    if len(s) >= 1 and s[-1:].isdigit():
+        return s[:-1]
+    return s
+
+
 def _time_sensor_task_id(hhmm: str) -> str:
     """Task id for the TimeSensor that waits until a time of day (HHMM)."""
     return f"time_{hhmm}"
@@ -207,11 +220,15 @@ def build_dag_yaml(
     deps: dict,
     mutually_exclusive_deps: dict,
     time_deps: dict,
+    runner_script: str = "",
+    first_arg: str = "",
 ) -> dict:
     """
     Build the DAG structure for one module.
     Missing upstreams -> ExternalTaskSensor; "/" deps -> mutually_exclusive_with;
     "J" deps (last 4 = time) -> TimeSensor tasks.
+    Bash: same runner_script and first_arg for all tasks (in default_args);
+    only params.jcl (per-task) differs.
     """
     task_list = []
     ordered_set = set(ordered_tasks)
@@ -223,11 +240,10 @@ def build_dag_yaml(
             if u not in logical_jobs:
                 external_upstreams.add(u)
 
-    # Sensor tasks for missing upstream jobs. Ids are already normalized when parsed
-    # (no day+run). Strip any leading "/" defensively so we never emit wait_for_/HQERUD1.
+    # Sensor tasks for missing upstream jobs. Normalize: no leading "/", strip last 2 chars if digits (day+run).
     seen = set()
     for ext_id in sorted(external_upstreams):
-        ext_norm = ext_id.lstrip("/").strip() or ext_id
+        ext_norm = _normalize_external_id(ext_id)
         if ext_norm in seen:
             continue
         seen.add(ext_norm)
@@ -259,21 +275,21 @@ def build_dag_yaml(
         jcl = info.get("jcl_name", "")
         # In-module upstreams
         upstream = [u for u in deps.get(task_id, set()) if u in ordered_set]
-        # External upstreams: depend on the sensor task (same id as sensor, no leading "/")
+        # External upstreams: depend on the sensor task (same normalized id as sensor)
         for u in deps.get(task_id, set()):
             if u not in logical_jobs:
-                u_norm = u.lstrip("/").strip() or u
-                upstream.append(_sensor_task_id(u_norm))
+                upstream.append(_sensor_task_id(_normalize_external_id(u)))
         # Time dependencies: depend on the TimeSensor task
         for hhmm in time_deps.get(task_id, set()):
             upstream.append(_time_sensor_task_id(hhmm))
         upstream = sorted(upstream)
         # Mutually exclusive: only include those that are in this DAG
         mut_ex = sorted(mutually_exclusive_deps.get(task_id, set()) & ordered_set)
+        # Same script + same first arg (from default_args) + per-task jcl
         task_def = {
             "task_id": task_id,
             "operator": "BashOperator",
-            "bash_command": "{{ params.jcl }}",
+            "bash_command": "{{ dag.default_args.runner_script }} {{ dag.default_args.first_arg }} {{ params.jcl }}",
             "params": {"jcl": jcl},
             "depends_on": upstream,
         }
@@ -281,15 +297,18 @@ def build_dag_yaml(
             task_def["mutually_exclusive_with"] = mut_ex
         task_list.append(task_def)
 
+    default_args = {
+        "owner": "ca7_migration",
+        "retries": 1,
+        "retry_delay_minutes": 5,
+        "runner_script": runner_script,
+        "first_arg": first_arg,
+    }
     return {
         "dag": {
             "dag_id": f"{module}_dag",
             "schedule": "@daily",
-            "default_args": {
-                "owner": "ca7_migration",
-                "retries": 1,
-                "retry_delay_minutes": 5,
-            },
+            "default_args": default_args,
             "tasks": task_list,
         }
     }
@@ -306,7 +325,12 @@ def write_yaml(path: Path, data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run(input_xlsx: str, output_dir: str) -> None:
+def run(
+    input_xlsx: str,
+    output_dir: str,
+    runner_script: str = "/opt/scripts/ca7_runner.sh",
+    first_arg: str = "run",
+) -> None:
     """Load Excel, normalize, group by module, validate (circular only), and write YAMLs."""
     df = load_excel(input_xlsx)
     logical_jobs, deps, mutually_exclusive_deps, time_deps = build_logical_jobs_and_deps(df)
@@ -326,7 +350,14 @@ def run(input_xlsx: str, output_dir: str) -> None:
             continue
         ordered = validate_and_order(logical_jobs, deps, module, job_list)
         dag_data = build_dag_yaml(
-            module, ordered, logical_jobs, deps, mutually_exclusive_deps, time_deps
+            module,
+            ordered,
+            logical_jobs,
+            deps,
+            mutually_exclusive_deps,
+            time_deps,
+            runner_script=runner_script,
+            first_arg=first_arg,
         )
         write_yaml(out_path / f"{module}_dag.yaml", dag_data)
 
@@ -339,10 +370,25 @@ def main() -> None:
     )
     parser.add_argument("input_xlsx", help="Path to input Excel file")
     parser.add_argument("output_dir", help="Output directory for YAML files")
+    parser.add_argument(
+        "--runner-script",
+        default="/opt/scripts/ca7_runner.sh",
+        help="Same shell script for all tasks (default: /opt/scripts/ca7_runner.sh)",
+    )
+    parser.add_argument(
+        "--first-arg",
+        default="run",
+        help="Same first argument for all tasks, in default_args (default: run)",
+    )
     args = parser.parse_args()
 
     try:
-        run(args.input_xlsx, args.output_dir)
+        run(
+            args.input_xlsx,
+            args.output_dir,
+            runner_script=args.runner_script,
+            first_arg=args.first_arg,
+        )
     except Exception as e:
         logger.exception("Failed: %s", e)
         sys.exit(1)
